@@ -18,9 +18,8 @@ next-env.d.ts
 /sql/
 /prod-ca-2021.crt
 
-# Local reference PDFs, OCR data and vector indexes
+# Local reference PDFs and vector indexes
 *.[pP][dD][fF]
-/reference-data/
 /.chroma/
 /chroma/
 chroma.sqlite3
