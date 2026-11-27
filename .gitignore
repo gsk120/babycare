@@ -20,12 +20,14 @@ next-env.d.ts
 
 # Local reference PDFs and vector indexes
 *.[pP][dD][fF]
+/output/
 /.chroma/
 /chroma/
 chroma.sqlite3
 chroma.sqlite3-*
 
 # Local debug logs and operating system files
+/.babycare/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

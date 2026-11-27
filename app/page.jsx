@@ -6,7 +6,10 @@ import {
   CookingPot, House, KeyRound, LogOut, Package, Plus, Settings as SettingsIcon,
   Smartphone, UserRound, Utensils, X,
 } from "lucide-react";
-import { formatDate, monthsOld, shoppingList, stages, todayInKorea, units, weekdays } from "./model";
+import { formatDate, maxCookingEnvironmentLength, monthsOld, shoppingList, stages, todayInKorea, units, weekdays } from "./model";
+import { cookingStepTitle } from "../lib/cooking-steps.js";
+import { createRecipeImageCache, recipeImagePollInterval } from "./recipe-image-cache.js";
+import { RecommendationHistory } from "./recommendation-history.jsx";
 
 const tabs = [
   { id: "today", name: "오늘", Icon: House },
@@ -14,7 +17,8 @@ const tabs = [
   { id: "records", name: "기록", Icon: ClipboardList },
   { id: "settings", name: "설정", Icon: SettingsIcon },
 ];
-const routes = new Set([...tabs.map((tab) => tab.id), "login", "signup"]);
+const historyRoute = "recommendation-history";
+const routes = new Set([...tabs.map((tab) => tab.id), historyRoute, "login", "signup"]);
 
 function SectionTitle({ title, children }) {
   return <div className="section-title"><h2>{title}</h2>{children}</div>;
@@ -26,6 +30,23 @@ function Field({ label, children }) {
 
 function Empty({ children }) {
   return <p className="empty">{children}</p>;
+}
+
+function FamilyLoading() {
+  return <section className="family-loading">
+    <p role="status" className="family-loading-status">
+      <span className="family-loading-spinner" aria-hidden="true" />
+      가족 정보를 불러오는 중이에요.
+    </p>
+    <div className="family-loading-preview" aria-hidden="true">
+      <div className="family-loading-date" />
+      <div className="family-loading-title" />
+      <div className="family-loading-summary" />
+      <div className="family-loading-list">
+        {[0, 1, 2].map((index) => <div className="family-loading-row" key={index} />)}
+      </div>
+    </div>
+  </section>;
 }
 
 function Overlay({ title, onClose, children }) {
@@ -63,7 +84,7 @@ function Today({ data, date, onRecipe, onRecord }) {
         </div>
       </section>
       <section className="dashboard-section">
-        <SectionTitle title="추천 메뉴" />
+        <SectionTitle title="추천 메뉴"><a className="text-button" href={"#" + historyRoute}>지난 추천 보기 <ChevronRight size={16} /></a></SectionTitle>
         <div className="recipe-list">
           {recipes.map((recipe) => <button className="recipe-row" key={recipe.id} onClick={() => onRecipe(recipe)}>
             <span className="recipe-icon lilac" aria-hidden="true"><CookingPot size={20} /></span>
@@ -81,7 +102,69 @@ function Today({ data, date, onRecipe, onRecord }) {
   </>;
 }
 
-function RecipeDetails({ recipe, onRecord }) {
+function CookingStepImage({ image, eager, itemId, imageCache }) {
+  const frame = useRef(null);
+  const [visible, setVisible] = useState(eager);
+  const [source, setSource] = useState(() => eager ? imageCache.peekFirstImage(itemId, image.url) : image.url);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (!eager) return;
+    let closed = false;
+    imageCache.loadFirstImage(itemId, image.url).then((url) => { if (!closed) setSource(url); });
+    return () => { closed = true; };
+  }, [eager, imageCache, image.url, itemId]);
+
+  useEffect(() => {
+    if (visible || !frame.current) return;
+    const target = frame.current;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) {
+        setVisible(true);
+        observer.disconnect();
+      }
+    }, { root: target.closest(".sheet") });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [visible]);
+
+  if (failed) return null;
+  return <div className="cooking-step-media" ref={frame}>
+    {visible && source && <img src={source} alt={image.alt} decoding="async" onError={() => setFailed(true)} />}
+  </div>;
+}
+
+function isImagePending(image) {
+  return image?.status === "pending" || image?.status === "processing";
+}
+
+function RecipeDetails({ recipe, onRecord, imageCache }) {
+  const [images, setImages] = useState(() => imageCache.peek(recipe.id));
+  const [imageRequest, setImageRequest] = useState(() => imageCache.peek(recipe.id).length ? "loaded" : "loading");
+  useEffect(() => {
+    let closed = false;
+    let timer;
+    async function load() {
+      try {
+        const steps = await imageCache.get(recipe.id);
+        if (closed) return;
+        setImages(steps);
+        setImageRequest("loaded");
+        if (steps.some(isImagePending)) {
+          timer = setTimeout(load, recipeImagePollInterval);
+        }
+      } catch {
+        if (!closed) setImageRequest("failed");
+      }
+    }
+    load();
+    return () => { closed = true; clearTimeout(timer); };
+  }, [imageCache, recipe.id]);
+  const imagesByStep = new Map(images.map((image) => [image.step, image]));
+  const loadingImages = imageRequest === "loading";
+  const pendingImages = imageRequest === "loaded" && images.some(isImagePending);
+  const imageUnavailable = imageRequest === "failed" ||
+    images.some(({ status, url }) => status === "failed" || (status === "ready" && !url));
+
   return <>
     {recipe.sources.map(({ book, page }) => <p className="muted source-line" key={book + ":" + page}><BookOpen size={17} />{book} · p.{page}</p>)}
     <div className="info-band">추천 분량 <strong>{recipe.meals}끼</strong></div>
@@ -89,7 +172,26 @@ function RecipeDetails({ recipe, onRecord }) {
     <h3>이 추천의 재료량</h3>
     <ul className="detail-list">{recipe.ingredients.map((item, index) => <li key={index}><span>{item.name}</span><strong>{item.quantity}{item.unit}</strong></li>)}</ul>
     <h3>조리 순서</h3>
-    <ol className="steps">{recipe.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
+    {(loadingImages || pendingImages) && <p role="status" className="muted cooking-note">
+      {loadingImages ? "조리 이미지를 불러오는 중이에요." : "아직 생성 중인 조리 이미지가 있어요."}
+    </p>}
+    {imageUnavailable && <p className="muted cooking-note">조리 이미지를 불러오지 못한 단계는 조리 설명으로 확인할 수 있어요.</p>}
+    {images.some((image) => image.url) && <p className="muted cooking-note">AI 생성 설명용 이미지예요. 재료량과 기기 설정은 레시피 설명을 따라 주세요.</p>}
+    <ol className="cooking-steps">
+      {recipe.steps.map((description, index) => {
+        const image = imagesByStep.get(index + 1);
+        const waitingForImage = loadingImages || (pendingImages && isImagePending(image));
+        return <li className="cooking-step" key={index}>
+          {image?.url && <CookingStepImage key={image.url} image={image} eager={index === 0} itemId={recipe.id} imageCache={imageCache} />}
+          {!image?.url && waitingForImage && <div className="cooking-step-media cooking-step-loading" aria-hidden="true" />}
+          <div className="cooking-step-text">
+            <span className="cooking-step-number">{index + 1}단계</span>
+            <h4>{image?.title ?? cookingStepTitle(description)}</h4>
+            <p>{description}</p>
+          </div>
+        </li>;
+      })}
+    </ol>
     <button className="primary-button full" onClick={() => onRecord(recipe)}><CookingPot size={18} />조리 기록 남기기</button>
   </>;
 }
@@ -139,7 +241,6 @@ function InventoryForm({ item, entries, onSave, saving }) {
 
 function Records({ entries, onAdd }) {
   return <>
-    <div className="page-intro"><h1>조리·식사 기록</h1><p>먹은 반응과 다음에 바라는 점을 줄글로 남겨요.</p></div>
     <div className="split-line"><h2>최근 기록</h2><button className="primary-button compact" onClick={onAdd}><Plus size={19} />기록 추가</button></div>
     <div className="record-list">{entries.length ? entries.map((entry) => <article className="card record-card" key={entry.id}>
       <div className="split-line"><span className="pill lilac">{entry.kind}</span><small className="muted">{formatDate(entry.date)}</small></div>
@@ -147,6 +248,19 @@ function Records({ entries, onAdd }) {
       {entry.notes && <p>{entry.notes}</p>}
       {entry.usage?.length > 0 && <small className="muted">사용 재료 · {entry.usage.map((item) => item.name + " " + item.quantity + item.unit).join(", ")}</small>}
     </article>) : <Empty>아직 기록이 없어요.</Empty>}</div>
+  </>;
+}
+
+function RecordsPage({ history, entries, date, onAdd, onRecipe }) {
+  return <>
+    <div className="page-intro"><h1>기록</h1></div>
+    <nav className="records-tabs" aria-label="기록 메뉴">
+      <a href="#records" aria-current={history ? undefined : "page"}>조리·식사 기록</a>
+      <a href={"#" + historyRoute} aria-current={history ? "page" : undefined}>지난 추천</a>
+    </nav>
+    {history
+      ? <RecommendationHistory date={date} load={loadRecommendationHistory} onRecipe={onRecipe} />
+      : <Records entries={entries} onAdd={onAdd} />}
   </>;
 }
 
@@ -192,13 +306,16 @@ function SettingsPage({ profile, familyName, date, onSave, onLogout, onChangePas
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const child = form.get("child").trim();
+    const cookingEnvironment = form.get("cookingEnvironment").trim();
     const meals = Number(form.get("meals"));
     const menuCount = Number(form.get("menuCount"));
     if (!child) return setError("아이 이름을 입력해 주세요.");
     if (!days.length) return setError("추천 요일을 하나 이상 선택해 주세요.");
     if (meals < menuCount) return setError("총 끼 수는 메뉴 수 이상이어야 해요.");
     setError("");
-    onSave({ child, birth: form.get("birth"), stage: form.get("stage"), days: weekdays.filter((day) => days.includes(day)), menuCount, meals });
+    onSave({ child, birth: form.get("birth"), stage: form.get("stage"),
+      days: weekdays.filter((day) => days.includes(day)), menuCount, meals,
+      ...(cookingEnvironment !== (profile.cookingEnvironment ?? "") && { cookingEnvironment }) });
   }
   return <>
     <div className="page-intro"><h1>설정</h1><p>{familyName}의 아이 정보와 이유식 일정을 관리해요.</p></div>
@@ -220,6 +337,15 @@ function SettingsPage({ profile, familyName, date, onSave, onLogout, onChangePas
           <Field label="메뉴 수"><input name="menuCount" type="number" min="1" max="30" defaultValue={profile.menuCount} required /></Field>
           <Field label="총 끼 수"><input name="meals" type="number" min="1" max="99" defaultValue={profile.meals} required /></Field>
         </div>
+      </section>
+      <section className="card settings-card">
+        <SectionTitle title="조리 환경" />
+        <Field label="조리 도구와 사용 방식 (선택)">
+          <textarea name="cookingEnvironment" rows={3} maxLength={maxCookingEnvironmentLength}
+            defaultValue={profile.cookingEnvironment ?? ""}
+            placeholder="예: 휘슬러 비타퀵 압력밥솥으로 이유식을 만들 거예요." />
+        </Field>
+        <p className="muted">저장한 내용은 다음 추천의 조리 순서에 반영돼요.</p>
       </section>
       {error && <p className="error" role="alert">{error}</p>}
       <button className="primary-button full" type="submit" disabled={saving}>{saving ? "저장 중…" : "설정 저장"}</button>
@@ -274,6 +400,10 @@ async function request(path, { method = "GET", body, signal } = {}) {
     throw error;
   }
   return result;
+}
+
+function loadRecommendationHistory(params, signal) {
+  return request("/api/family/recommendation-history?" + new URLSearchParams(params), { signal });
 }
 
 const savedEmailKey = "babycare.login.email";
@@ -347,10 +477,16 @@ export default function Babycare() {
   const [data, setData] = useState(null);
   const [date, setDate] = useState(todayInKorea);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [overlay, setOverlay] = useState(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [imageCache] = useState(() => createRecipeImageCache((itemId, signal) => {
+    const query = new URLSearchParams({ itemId });
+    return request("/api/family/recipe-images?" + query, { signal });
+  }));
   const operation = useRef(false);
 
   useEffect(() => {
@@ -363,19 +499,22 @@ export default function Babycare() {
     syncRoute();
     setDate(todayInKorea());
     window.addEventListener("hashchange", syncRoute);
+    return () => window.removeEventListener("hashchange", syncRoute);
+  }, []);
+
+  useEffect(() => {
     const controller = new AbortController();
     request("/api/family", { signal: controller.signal }).then((snapshot) => {
       if (!controller.signal.aborted) setData(snapshot);
     }).catch((failure) => {
-      if (!controller.signal.aborted && failure.status !== 401) setError(failure.message);
+      if (controller.signal.aborted || failure.status === 401) return;
+      if (failure.status === 403) setError(failure.message);
+      else setLoadError(failure.message || "가족 정보를 불러오지 못했어요.");
     }).finally(() => {
       if (!controller.signal.aborted) setLoading(false);
     });
-    return () => {
-      controller.abort();
-      window.removeEventListener("hashchange", syncRoute);
-    };
-  }, []);
+    return () => controller.abort();
+  }, [loadAttempt]);
 
   useEffect(() => {
     if (!notice) return;
@@ -385,13 +524,36 @@ export default function Babycare() {
 
   const recipes = data?.recommendation?.recipes ?? [];
   const currentPage = data && (page === "login" || page === "signup") ? "today" : page;
+  const currentTab = currentPage === historyRoute ? "records" : currentPage;
+  const firstRecipeId = currentPage === "today" ? recipes[0]?.id : undefined;
+  useEffect(() => {
+    if (!firstRecipeId) return;
+    let closed = false;
+    async function preload() {
+      const pending = await imageCache.preloadFirst(firstRecipeId).catch(() => false);
+      if (pending && !closed) timer = setTimeout(preload, recipeImagePollInterval);
+    }
+    let timer = setTimeout(preload, 0);
+    return () => { closed = true; clearTimeout(timer); };
+  }, [firstRecipeId, imageCache]);
+  useEffect(() => () => imageCache.clear(), [imageCache]);
   const close = () => { setOverlay(null); setError(""); };
   const show = (modal) => { setError(""); setOverlay(modal); };
   const openRecord = (recipe = null) => show({ type: "record", recipe });
+  const openRecipe = (recipe) => show({ type: "recipe", recipe });
+  const recordRecipe = overlay?.type === "record" ? overlay.recipe : null;
+  const recordRecipes = recordRecipe && !recipes.some(({ id }) => id === recordRecipe.id) ? [recordRecipe, ...recipes] : recipes;
+
+  function retryFamilyLoad() {
+    setLoadError("");
+    setLoading(true);
+    setLoadAttempt((attempt) => attempt + 1);
+  }
 
   async function login(credentials) {
     setError("");
     await request("/api/session", { method: "POST", body: credentials });
+    imageCache.clear();
     setData(await request("/api/family"));
     setNotice("");
     window.location.hash = "today";
@@ -404,6 +566,7 @@ export default function Babycare() {
     setError("");
     try {
       await request("/api/session", { method: "DELETE" });
+      imageCache.clear();
       close();
       setNotice("");
       setData(null);
@@ -427,12 +590,14 @@ export default function Babycare() {
     setError("");
     try {
       await request("/api/session", { method: "PATCH", body: payload });
+      imageCache.clear();
       close();
       setData(null);
       setNotice("비밀번호를 변경했어요. 다시 로그인해 주세요.");
       window.location.hash = "login";
     } catch (failure) {
       if (failure.status === 401) {
+        imageCache.clear();
         close();
         setData(null);
         window.location.hash = "login";
@@ -455,6 +620,7 @@ export default function Babycare() {
       setNotice(message);
     } catch (failure) {
       if (failure.status === 401 || failure.status === 403) {
+        imageCache.clear();
         close();
         setData(null);
         window.location.hash = "login";
@@ -472,19 +638,24 @@ export default function Babycare() {
       {data && <div className="header-actions"><a className="icon-button" href="#settings" aria-label="알림 설정"><Bell size={20} /></a><a className="icon-button avatar" href="#settings" aria-label="가족 설정"><UserRound size={19} /></a></div>}
     </header>
     <main className="main">
-      {loading && <p className="empty" role="status">가족 정보를 불러오는 중이에요.</p>}
-      {!loading && !data && <AuthView key={page === "signup" ? "signup" : "login"} signup={page === "signup"} onLogin={login} initialError={error} />}
+      {loading && <FamilyLoading />}
+      {loadError && <section className="card family-load-error">
+        <p className="error" role="alert">{loadError}</p>
+        <button type="button" className="primary-button compact" onClick={retryFamilyLoad}>다시 시도</button>
+      </section>}
+      {!loading && !loadError && !data && <AuthView key={page === "signup" ? "signup" : "login"} signup={page === "signup"} onLogin={login} initialError={error} />}
       {data && <>
         {!overlay && error && <p className="error page-error" role="alert">{error}</p>}
-        {currentPage === "today" && <Today data={data} date={date} onRecipe={(recipe) => show({ type: "recipe", recipe })} onRecord={openRecord} />}
+        {currentPage === "today" && <Today data={data} date={date} onRecipe={openRecipe} onRecord={openRecord} />}
         {currentPage === "inventory" && <Inventory entries={data.inventory} onAdd={() => show({ type: "inventory" })} onEdit={(item) => show({ type: "inventory", item })} />}
-        {currentPage === "records" && <Records entries={data.records} onAdd={() => openRecord()} />}
+        {currentTab === "records" && <RecordsPage history={currentPage === historyRoute} entries={data.records} date={date}
+          onAdd={() => openRecord()} onRecipe={openRecipe} />}
         {currentPage === "settings" && <SettingsPage profile={data.profile} familyName={data.family.name} date={date} saving={saving} onLogout={logout} onChangePassword={() => show({ type: "password" })} onSave={(profile) => save("profile", profile, "설정을 저장했어요.")} />}
       </>}
     </main>
     {data && <nav className="bottom-nav" aria-label="주 메뉴">
-      {tabs.map(({ id, name, Icon }) => <a key={id} href={"#" + id} className={currentPage === id ? "active" : ""} aria-current={currentPage === id ? "page" : undefined}>
-        <span><Icon size={21} strokeWidth={currentPage === id ? 2.25 : 1.8} /></span>{name}
+      {tabs.map(({ id, name, Icon }) => <a key={id} href={"#" + id} className={currentTab === id ? "active" : ""} aria-current={currentTab === id ? "page" : undefined}>
+        <span><Icon size={21} strokeWidth={currentTab === id ? 2.25 : 1.8} /></span>{name}
       </a>)}
     </nav>}
     <div className="notice-wrap" aria-live="polite">{notice && <div className="notice"><Check size={18} />{notice}</div>}</div>
@@ -492,14 +663,14 @@ export default function Babycare() {
       {error && <p className="error page-error" role="alert">{error}</p>}
       <PasswordForm saving={saving} onSave={changePassword} />
     </Overlay>}
-    {data && overlay?.type === "recipe" && <Overlay key="recipe" title={overlay.recipe.name} onClose={close}><RecipeDetails recipe={overlay.recipe} onRecord={openRecord} /></Overlay>}
+    {data && overlay?.type === "recipe" && <Overlay key="recipe" title={overlay.recipe.name} onClose={close}><RecipeDetails key={overlay.recipe.id} recipe={overlay.recipe} onRecord={openRecord} imageCache={imageCache} /></Overlay>}
     {data && overlay?.type === "inventory" && <Overlay key="inventory" title={overlay.item ? "재고 수정" : "재료 추가"} onClose={close}>
       {error && <p className="error page-error" role="alert">{error}</p>}
       <InventoryForm item={overlay.item} entries={data.inventory} saving={saving} onSave={(item) => save("inventory", item, "재고를 저장했어요.")} />
     </Overlay>}
     {data && overlay?.type === "record" && <Overlay key="record" title="조리·식사 기록 추가" onClose={close}>
       {error && <p className="error page-error" role="alert">{error}</p>}
-      <RecordForm recipe={overlay.recipe} recipes={recipes} date={date} saving={saving} onSave={(record) => save("record", record, "기록을 저장했어요.")} />
+      <RecordForm recipe={overlay.recipe} recipes={recordRecipes} date={date} saving={saving} onSave={(record) => save("record", record, "기록을 저장했어요.")} />
     </Overlay>}
   </div>;
 }

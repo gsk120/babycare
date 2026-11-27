@@ -1,0 +1,268 @@
+#!/usr/bin/env node
+import { spawn, spawnSync } from "node:child_process";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmdirSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
+import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
+import { parseArgs } from "node:util";
+
+process.chdir(fileURLToPath(new URL(".", import.meta.url)));
+
+const directory = ".babycare";
+const statePath = directory + "/server.json";
+const logPath = directory + "/server.log";
+const lockPath = directory + "/server.lock";
+const host = "127.0.0.1";
+const defaultPort = 3000;
+const commands = {
+  start: "start [--port <포트>]       로컬 웹 서버를 백그라운드에서 시작",
+  status: "status                      웹 서버 상태와 주소 확인",
+  stop: "stop                        웹 서버 종료",
+  restart: "restart [--port <포트>]     웹 서버 재시작 (기본값은 기존 포트)",
+  logs: "logs [--lines <수>] [-f]     웹 서버 로그 확인 (기본 50줄, -f는 실시간)",
+  worker: "worker --family-id <UUID> [--preview]   해당 가족의 오늘 추천 실행",
+  images: "images --family-id <UUID>   최근 추천의 조리 이미지 생성 또는 재시도",
+};
+
+function help(command) {
+  if (command) {
+    console.log("./babycare " + commands[command]);
+    if (command === "start") console.log("기본 주소는 http://localhost:3000입니다.");
+    if (command === "worker") console.log("--preview를 붙이면 추천을 저장하지 않고 출력합니다. 워커 접속 설정은 .env.worker를 읽습니다.");
+    if (command === "images") console.log("iMac의 Codex CLI로 조리 이미지를 생성하고 이미 저장된 이미지를 재사용합니다.");
+    if (command === "logs") console.log("-f, --follow  새 로그를 계속 표시합니다. Ctrl+C로 로그 보기를 끝냅니다.");
+    return;
+  }
+  console.log(["사용법  ./babycare <명령> [옵션]", "", ...Object.values(commands).map((line) => "  " + line),
+    "", "자세한 사용법  ./babycare <명령> --help"].join("\n"));
+}
+
+function identity(pid, environment = { LC_ALL: "C", TZ: "UTC" }) {
+  const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "pgid=", "-o", "lstart="],
+    { encoding: "utf8", env: { ...process.env, ...environment } });
+  if (result.error) throw result.error;
+  const output = result.stdout.trim();
+  if (result.status === 1 && !output && !result.stderr.trim()) return null;
+  if (result.status !== 0) throw new Error("웹 서버 프로세스를 확인할 수 없어요.");
+  const match = output.match(/^(\d+)\s+(.+)$/);
+  return match && Number(match[1]) === pid ? match[2] : null;
+}
+
+function readServerState() {
+  let state;
+  try { state = JSON.parse(readFileSync(statePath, "utf8")); }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!Number.isInteger(state?.port) || state.port < 1 || state.port > 65535 ||
+      (state.pid !== undefined && (!Number.isSafeInteger(state.pid) || state.pid < 2 ||
+        typeof (state.startedAtUtc ?? state.startedAt) !== "string"))) {
+    throw new Error("로컬 서버 상태 파일을 읽을 수 없어요. " + statePath);
+  }
+  return state;
+}
+
+function ownsServer(state) {
+  if (!state?.pid) return false;
+  if (state.startedAtUtc) return identity(state.pid) === state.startedAtUtc;
+  // Older state files recorded the terminal's localized ps output.
+  return [{}, { LC_ALL: "C" }, { LC_ALL: "ko_KR.UTF-8" }].some(
+    (environment) => identity(state.pid, environment) === state.startedAt,
+  );
+}
+
+function writeServerState(state) {
+  writeFileSync(statePath + ".tmp", JSON.stringify(state), { mode: 0o600 });
+  renameSync(statePath + ".tmp", statePath);
+}
+
+function serverGroupExists(pid) {
+  try { process.kill(-pid, 0); return true; }
+  catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function withServerLock(run) {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try { mkdirSync(lockPath, { mode: 0o700 }); }
+  catch (error) {
+    if (error.code === "EEXIST") throw new Error("다른 서버 제어 명령이 실행 중이에요.");
+    throw error;
+  }
+  const release = () => rmdirSync(lockPath);
+  const interrupt = () => { release(); process.exit(130); };
+  process.once("SIGINT", interrupt);
+  process.once("SIGTERM", interrupt);
+  try { await run(); }
+  finally {
+    process.off("SIGINT", interrupt);
+    process.off("SIGTERM", interrupt);
+    release();
+  }
+}
+
+function listening(port, address = host) {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: address, port });
+    function finish(open) {
+      socket.destroy();
+      resolve(open);
+    }
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(300, () => finish(false));
+  });
+}
+
+async function portInUse(port) {
+  const listeners = await Promise.all([listening(port), listening(port, "::1")]);
+  return listeners.some(Boolean);
+}
+
+function showServer(state, message = "웹 서버가 실행 중이에요.") {
+  console.log(`${message}  http://localhost:${state.port}  (PID ${state.pid})`);
+}
+
+async function start(port, state) {
+  if (ownsServer(state)) {
+    if (!await listening(state.port)) throw new Error("웹 서버 프로세스는 실행 중이지만 아직 접속할 수 없어요. ./babycare logs를 확인해 주세요.");
+    showServer(state, "웹 서버가 이미 실행 중이에요.");
+    return;
+  }
+  if (await portInUse(port)) throw new Error(`포트 ${port}가 이미 사용 중이에요. --port로 다른 포트를 지정해 주세요.`);
+
+  const output = openSync(logPath, "a", 0o600);
+  let child;
+  try {
+    writeFileSync(output, `\n--- Babycare 시작 ${new Date().toISOString()} (포트 ${port}) ---\n`);
+    child = spawn(process.execPath, ["node_modules/next/dist/bin/next", "dev", "--hostname", host, "--port", String(port)],
+      { detached: true, stdio: ["ignore", output, output] });
+  } finally { closeSync(output); }
+
+  let launchError;
+  child.on("error", (error) => { launchError = error; });
+  child.unref();
+  let started;
+  try {
+    const startedAtUtc = child.pid && identity(child.pid);
+    if (!startedAtUtc) {
+      await delay(0);
+      throw launchError ?? new Error("웹 서버를 시작하지 못했어요. ./babycare logs를 확인해 주세요.");
+    }
+    started = { pid: child.pid, startedAtUtc, port };
+    writeServerState(started);
+  } catch (error) {
+    child.kill();
+    throw error;
+  }
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (!ownsServer(started)) {
+      throw new Error("웹 서버가 종료됐어요. ./babycare logs를 확인해 주세요.");
+    }
+    if (await listening(port)) {
+      showServer(started, "웹 서버를 시작했어요.");
+      return;
+    }
+    await delay(250);
+  }
+  throw new Error("웹 서버가 아직 포트를 열지 못했어요. ./babycare status와 logs를 확인해 주세요.");
+}
+
+async function stop(state) {
+  const port = state?.port ?? defaultPort;
+  const wasRunning = ownsServer(state);
+  if (wasRunning) {
+    try { process.kill(-state.pid, "SIGTERM"); }
+    catch (error) { if (error.code !== "ESRCH") throw error; }
+    const deadline = Date.now() + 10_000;
+    while (serverGroupExists(state.pid) || await portInUse(port)) {
+      if (Date.now() >= deadline) throw new Error(`웹 서버의 종료나 포트 ${port}의 해제를 확인하지 못했어요. ./babycare status를 확인해 주세요.`);
+      await delay(200);
+    }
+  } else if (await portInUse(port)) {
+    throw new Error(`포트 ${port}가 아직 열려 있어요. ./babycare가 시작한 서버인지 확인할 수 없어 종료 명령을 보내지 않았어요.`);
+  }
+  if (state?.pid) writeServerState({ port });
+  console.log(wasRunning ? "웹 서버를 종료했어요." : "웹 서버가 이미 중지돼 있어요.");
+}
+
+function positiveInteger(value, label, max = Number.MAX_SAFE_INTEGER) {
+  const number = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(number) || number < 1 || number > max) {
+    throw new Error(label + "에 유효한 양의 정수를 입력해 주세요.");
+  }
+  return number;
+}
+
+async function main() {
+  const [command, ...args] = process.argv.slice(2);
+  if (!command || command === "--help" || command === "-h") return help();
+  if (command === "help" && !args.length) return help();
+  const target = command === "help" ? args[0] : command;
+  if (!Object.hasOwn(commands, target)) throw new Error("지원하는 명령은 ./babycare --help에서 확인해 주세요.");
+  if (command === "help" || args.includes("--help") || args.includes("-h")) return help(target);
+
+  const options = {
+    start: { port: { type: "string" } },
+    restart: { port: { type: "string" } },
+    logs: { lines: { type: "string", default: "50" }, follow: { type: "boolean", short: "f" } },
+    worker: { "family-id": { type: "string" }, preview: { type: "boolean" } },
+    images: { "family-id": { type: "string" } },
+  };
+  const { values } = parseArgs({ args, options: options[command] ?? {} });
+
+  if (command === "worker" || command === "images") {
+    const family = values["family-id"];
+    if (!family) throw new Error(`--family-id에 가족 UUID를 입력해 주세요. ./babycare ${command} --help`);
+    const script = command === "images" ? "worker/images.mjs" : "worker/recommend.mjs";
+    const workerArgs = ["--env-file-if-exists=.env.worker", script, "--family", family];
+    if (values.preview) workerArgs.push("--preview");
+    const result = spawnSync(process.execPath, workerArgs, { stdio: "inherit" });
+    if (result.error) throw result.error;
+    process.exitCode = result.status ?? (result.signal === "SIGINT" ? 130 : 1);
+    return;
+  }
+
+  if (command === "status") {
+    const state = readServerState();
+    if (ownsServer(state)) {
+      if (await listening(state.port)) showServer(state);
+      else {
+        console.log(`웹 서버 프로세스가 실행 중이지만 포트 ${state.port}에 접속할 수 없어요.`);
+        process.exitCode = 1;
+      }
+    } else {
+      const port = state?.port ?? defaultPort;
+      console.log(await portInUse(port)
+        ? `포트 ${port}가 열려 있어요. ./babycare가 시작한 서버인지 확인할 수 없어요.`
+        : "웹 서버가 중지돼 있어요.");
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "logs") {
+    const lines = positiveInteger(values.lines, "--lines");
+    const result = spawnSync("tail", ["-n", String(lines), ...(values.follow ? ["-f"] : []), logPath], { stdio: "inherit" });
+    if (result.error) throw result.error;
+    process.exitCode = result.status ?? (result.signal === "SIGINT" ? 130 : 1);
+    return;
+  }
+
+  const port = values.port === undefined ? undefined : positiveInteger(values.port, "--port", 65535);
+  await withServerLock(async () => {
+    const state = readServerState();
+    if (command !== "start") await stop(state);
+    if (command !== "stop") await start(port ?? (command === "restart" ? state?.port : undefined) ?? defaultPort,
+      command === "start" ? state : null);
+  });
+}
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});

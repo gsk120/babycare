@@ -1,10 +1,12 @@
 {
   "name": "babycare-ai",
   "version": "0.1.0",
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "worker:recommend": "node --env-file-if-exists=.env.worker worker/recommend.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
@@ -13,7 +15,8 @@
     "next": "^16.4.6",
     "pg": "^8.23.1",
     "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+    "react-dom": "^19.3.1",
+    "sharp": "0.35.5"
   },
   "private": true
 }
